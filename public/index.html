@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101d23">
+    <title>REA Local Analyzer</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="REA Local Analyzer home">
+        <span class="brand-mark" aria-hidden="true">R</span>
+        <span class="brand-name">REA<span class="brand-light"> / ANALYZER</span></span>
+      </a>
+      <div class="topbar-actions">
+        <div class="local-indicator"><span class="status-dot"></span><span id="connection-label">LOCAL SESSION</span></div>
+        <div class="chatgpt-controls" aria-label="ChatGPT account">
+          <span id="chatgpt-label" class="chatgpt-label">ChatGPT plan not connected</span>
+          <button id="chatgpt-signin" class="button button-chatgpt" type="button"><img src="https://developers.openai.com/assets/siwc/sign-in-buttons/chatgpt-logo-black.svg" alt="" width="18" height="18"><span id="chatgpt-signin-label">Continue with ChatGPT</span></button>
+          <select id="chatgpt-account" aria-label="Active ChatGPT account" hidden></select>
+          <button id="chatgpt-add-account" class="text-button" type="button" hidden>Add account</button>
+          <button id="chatgpt-signout" class="text-button" type="button" hidden>Sign out</button>
+          <a id="manage-usage" class="manage-usage" href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer" hidden>Manage usage</a>
+        </div>
+      </div>
+    </header>
+
+    <aside id="file-open-notice" class="file-open-notice" hidden>
+      <p class="eyebrow">ONE MORE STEP</p>
+      <h1>Open the local analyzer</h1>
+      <p>This page was opened as a file. REA needs its local server for website capture, app analysis, and ChatGPT sign-in.</p>
+      <a class="button button-primary file-open-link" href="http://127.0.0.1:4173/">Open the running analyzer <span aria-hidden="true">↗</span></a>
+      <p class="file-open-help">To start it later, double-click <strong>Start REA Website.command</strong> in the REA Local Analyzer folder, then choose the Website link tab.</p>
+    </aside>
+
+    <main class="page-shell">
+      <section class="intro">
+        <p class="eyebrow">REVERSE ENGINEER ANYTHING</p>
+        <h1>Look inside apps<br><span>and websites.</span></h1>
+        <p class="intro-copy">Choose a JavaScript or Electron app on this Mac, or paste a public website link. REA inspects local app files or captures the website’s first page and loaded JavaScript.</p>
+      </section>
+
+      <section class="workspace" aria-label="Application and website analysis">
+        <div class="setup-panel">
+          <div class="panel-heading">
+            <span class="step-number">01</span>
+            <div>
+              <h2>Choose your target</h2>
+              <p>Analyze an app on this Mac or a public website.</p>
+            </div>
+          </div>
+
+          <div class="target-tabs" role="tablist" aria-label="Target type">
+            <button id="local-target-tab" class="target-tab active" type="button" role="tab" aria-selected="true" aria-controls="local-target-panel">Mac app</button>
+            <button id="website-target-tab" class="target-tab" type="button" role="tab" aria-selected="false" aria-controls="website-target-panel">Website link</button>
+          </div>
+
+          <div id="local-target-panel" class="target-panel" role="tabpanel" aria-labelledby="local-target-tab">
+          <form id="analysis-form">
+            <label class="field-label" for="target-path">Application path</label>
+            <div class="path-row">
+              <input id="target-path" name="path" type="text" autocomplete="off" spellcheck="false" placeholder="Choose a target or paste its full path" required>
+              <button id="choose-target" class="button button-secondary" type="button">
+                <span aria-hidden="true">＋</span> Browse
+              </button>
+            </div>
+            <p class="field-help">Choose a .app bundle, <code>app.asar</code>, or extracted app folder. REA looks inside app bundles for their JavaScript files.</p>
+
+            <div class="capability-note">
+              <span class="note-icon" aria-hidden="true">i</span>
+              <p>Your app files stay on this Mac. If you choose Ask ChatGPT, your question and REA output are sent to OpenAI to answer it.</p>
+            </div>
+
+            <button id="analyze-button" class="button button-primary" type="submit">
+              <span class="button-label">Analyze application</span>
+              <span class="button-arrow" aria-hidden="true">↗</span>
+            </button>
+          </form>
+          </div>
+
+          <div id="website-target-panel" class="target-panel" role="tabpanel" aria-labelledby="website-target-tab" hidden>
+            <form id="website-form">
+              <label class="field-label" for="website-url">Public website link</label>
+              <input id="website-url" name="url" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://example.com" required>
+              <p class="field-help">Paste a public HTTP or HTTPS link. REA opens the first page in a temporary browser, records its page structure and loaded scripts, then analyzes a compact sample of the captured JavaScript graph.</p>
+
+              <div class="capability-note website-note">
+                <span class="note-icon" aria-hidden="true">i</span>
+                <p>This Mac fetches the page and its public resources. The browser starts without sign-in or saved cookies. Private and local network addresses are blocked; login, later pages, and game interactions are not replayed.</p>
+              </div>
+
+              <button id="website-analyze-button" class="button button-primary" type="submit">
+                <span class="button-label">Analyze website</span>
+                <span class="button-arrow" aria-hidden="true">↗</span>
+              </button>
+            </form>
+          </div>
+
+          <div id="status-message" class="status-message" role="status" aria-live="polite">Checking the local REA connection…</div>
+        </div>
+
+        <div class="results-panel">
+          <div class="results-heading">
+            <div>
+              <p class="eyebrow">ANALYSIS OUTPUT</p>
+              <h2 id="result-title">Ready when you are</h2>
+            </div>
+            <span id="result-state" class="result-state">IDLE</span>
+          </div>
+          <div class="result-body">
+            <div id="empty-state" class="empty-state">
+              <div class="empty-symbol" aria-hidden="true"><span></span><span></span><span></span></div>
+              <p>Choose a Mac app or paste a website link to see REA’s evidence here.</p>
+            </div>
+            <figure id="website-preview" class="website-preview" hidden>
+              <img id="website-preview-image" alt="Screenshot of the captured website page">
+              <figcaption>First page captured in a temporary browser</figcaption>
+            </figure>
+            <div id="result-output" class="result-output" hidden></div>
+          </div>
+          <section id="ai-panel" class="ai-panel" hidden aria-label="Ask ChatGPT about findings">
+            <div class="ai-panel-heading">
+              <div>
+                <p class="eyebrow">CHATGPT PLAN</p>
+                <h3>Ask ChatGPT about the findings</h3>
+                <p>Use your ChatGPT plan to ask a question about this REA analysis.</p>
+              </div>
+            </div>
+            <label class="question-control" for="chatgpt-prompt">Your question
+              <textarea id="chatgpt-prompt" maxlength="4000">Explain these findings in plain language and suggest practical next steps.</textarea>
+            </label>
+            <div class="ai-action-row">
+              <label class="model-control" for="ai-model">Model
+                <select id="ai-model" aria-label="ChatGPT model"></select>
+              </label>
+              <button id="explain-button" class="button button-primary" type="button" disabled>
+                <span class="button-label">Ask ChatGPT</span>
+                <span class="button-arrow" aria-hidden="true">↗</span>
+              </button>
+            </div>
+            <p class="ai-privacy">When you click Ask ChatGPT, your question and up to the first 80,000 characters of REA’s output (which may contain local paths, website URLs, page text, or code excerpts) are sent to OpenAI. REA does not upload selected app files.</p>
+            <div id="ai-status" class="ai-status" role="status" aria-live="polite"></div>
+            <pre id="ai-output" class="ai-output" hidden></pre>
+          </section>
+          <div class="results-footer">
+            <span>Evidence returned by REA</span>
+            <button id="copy-output" class="text-button" type="button" disabled>Copy output</button>
+          </div>
+        </div>
+      </section>
+
+      <footer class="page-footer">
+        <span>REA runs on this Mac</span>
+        <span class="footer-separator" aria-hidden="true">·</span>
+        <span>Mac apps and public websites</span>
+      </footer>
+    </main>
+    <dialog id="chatgpt-welcome" class="welcome-dialog">
+      <div class="welcome-content">
+        <p class="eyebrow">CHATGPT PLAN</p>
+        <h2>You’re using your ChatGPT plan</h2>
+        <p>Eligible AI requests in REA Local Analyzer use the ChatGPT plan or credits you authorized. You can review this app’s usage and limits in ChatGPT settings.</p>
+        <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">Manage usage</a>
+        <button id="welcome-dismiss" class="button button-primary" type="button">Got it</button>
+      </div>
+    </dialog>
+  </body>
+</html>
