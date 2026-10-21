@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#101d23">
-    <title>REA Local Analyzer</title>
+    <title>REA Website Analyzer | BETA</title>
     <link rel="stylesheet" href="./styles.css">
     <script src="./app.js" defer></script>
   </head>
@@ -13,6 +13,7 @@
       <a class="brand" href="/" aria-label="REA Local Analyzer home">
         <span class="brand-mark" aria-hidden="true">R</span>
         <span class="brand-name">REA<span class="brand-light"> / ANALYZER</span></span>
+        <span class="brand-beta">BETA</span>
       </a>
       <div class="topbar-actions">
         <div class="local-indicator"><span class="status-dot"></span><span id="connection-label">LOCAL SESSION</span></div>
@@ -39,7 +40,7 @@
       <section class="intro">
         <p class="eyebrow">REVERSE ENGINEER ANYTHING</p>
         <h1>Look inside apps<br><span>and websites.</span></h1>
-        <p class="intro-copy">Choose a JavaScript or Electron app on this Mac, or paste a public website link. REA inspects local app files or captures the website’s first page and loaded JavaScript.</p>
+        <p class="intro-copy">Choose a JavaScript or Electron app on this Mac, or paste a public website link. REA inspects local app files or maps a small set of linked website pages, their structure, and loaded JavaScript.</p>
       </section>
 
       <section class="workspace" aria-label="Application and website analysis">
@@ -84,11 +85,19 @@
             <form id="website-form">
               <label class="field-label" for="website-url">Public website link</label>
               <input id="website-url" name="url" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://example.com" required>
-              <p class="field-help">Paste a public HTTP or HTTPS link. REA opens the first page in a temporary browser, records its page structure and loaded scripts, then analyzes a compact sample of the captured JavaScript graph.</p>
+              <p class="field-help">Paste a public HTTP or HTTPS link. REA discovers same-site links from that page, captures the selected pages in one temporary browser session, and analyzes their loaded JavaScript together.</p>
+
+              <label class="field-label page-coverage-label" for="website-page-limit">Page coverage</label>
+              <select id="website-page-limit" class="analysis-select" aria-label="Maximum website pages to capture">
+                <option value="5" selected>Discover up to 5 linked pages</option>
+                <option value="3">Discover up to 3 linked pages</option>
+                <option value="1">Only the supplied page</option>
+              </select>
+              <p class="field-help">Pages are selected from public links on the supplied page. Sign-in, form submissions, menus, and other interactions are not replayed.</p>
 
               <div class="capability-note website-note">
                 <span class="note-icon" aria-hidden="true">i</span>
-                <p>This Mac fetches the page and its public resources. The browser starts without sign-in or saved cookies. Private and local network addresses are blocked; login, later pages, and game interactions are not replayed.</p>
+                <p>This Mac fetches the page and its public resources. The browser starts without sign-in or saved cookies. Private and local network addresses are blocked; only same-origin links are included in automatic page discovery.</p>
               </div>
 
               <button id="website-analyze-button" class="button button-primary" type="submit">
@@ -114,10 +123,7 @@
               <div class="empty-symbol" aria-hidden="true"><span></span><span></span><span></span></div>
               <p>Choose a Mac app or paste a website link to see REA’s evidence here.</p>
             </div>
-            <figure id="website-preview" class="website-preview" hidden>
-              <img id="website-preview-image" alt="Screenshot of the captured website page">
-              <figcaption>First page captured in a temporary browser</figcaption>
-            </figure>
+            <section id="website-preview" class="website-preview" aria-label="Captured website page screenshots" hidden></section>
             <div id="result-output" class="result-output" hidden></div>
           </div>
           <section id="ai-panel" class="ai-panel" hidden aria-label="Ask ChatGPT about findings">

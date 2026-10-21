@@ -2,6 +2,7 @@ const form = document.querySelector("#analysis-form");
 const websiteForm = document.querySelector("#website-form");
 const pathInput = document.querySelector("#target-path");
 const websiteUrlInput = document.querySelector("#website-url");
+const websitePageLimitInput = document.querySelector("#website-page-limit");
 const chooseButton = document.querySelector("#choose-target");
 const analyzeButton = document.querySelector("#analyze-button");
 const websiteAnalyzeButton = document.querySelector("#website-analyze-button");
@@ -14,7 +15,6 @@ const connectionLabel = document.querySelector("#connection-label");
 const localIndicator = document.querySelector(".local-indicator");
 const emptyState = document.querySelector("#empty-state");
 const websitePreview = document.querySelector("#website-preview");
-const websitePreviewImage = document.querySelector("#website-preview-image");
 const resultOutput = document.querySelector("#result-output");
 const resultTitle = document.querySelector("#result-title");
 const resultState = document.querySelector("#result-state");
@@ -77,6 +77,8 @@ function renderAnalysisOutput(output, overview = null) {
     const semantic = overview.javascript?.semanticGraph;
     const count = (value) => Number.isFinite(Number(value)) ? Number(value).toLocaleString() : "—";
     const metrics = [
+      ["Pages captured", count(overview.pagesCaptured) + " / " + count(overview.pageLimit)],
+      ["Pages discovered", count(overview.discoveredPages)],
       ["Page requests", count(overview.networkRequests)],
       ["Scripts exported", count(overview.exportedScripts) + " / " + count(overview.observedScripts)],
       ["JS files parsed", count(stats.parsed_javascript_files)],
@@ -99,6 +101,44 @@ function renderAnalysisOutput(output, overview = null) {
     }
     section.append(grid);
 
+    const pages = Array.isArray(overview.pages) ? overview.pages : [];
+    if (pages.length) {
+      const pageList = document.createElement("div");
+      pageList.className = "overview-pages";
+      const pageListHeading = document.createElement("h4");
+      pageListHeading.textContent = "Pages in this run";
+      pageList.append(pageListHeading);
+      for (const [index, page] of pages.entries()) {
+        const card = document.createElement("article");
+        card.className = "overview-page";
+        const heading = document.createElement("a");
+        heading.href = page.url;
+        heading.target = "_blank";
+        heading.rel = "noreferrer";
+        heading.textContent = (index + 1) + ". " + (page.title || "Public page");
+        const address = document.createElement("p");
+        address.textContent = page.url;
+        card.append(heading, address);
+        if (page.description) {
+          const description = document.createElement("p");
+          description.className = "overview-page-description";
+          description.textContent = page.description;
+          card.append(description);
+        }
+        if (Array.isArray(page.headings) && page.headings.length) {
+          const outline = document.createElement("p");
+          outline.className = "overview-page-outline";
+          outline.textContent = page.headings.slice(0, 6).map(item => "H" + item.level + " " + item.text).join(" · ");
+          card.append(outline);
+        }
+        const counts = document.createElement("small");
+        counts.textContent = count(page.linkCount) + " links · " + count(page.formControlCount) + " form controls";
+        card.append(counts);
+        pageList.append(card);
+      }
+      section.append(pageList);
+    }
+
     const capture = document.createElement("p");
     capture.className = "overview-note";
     const duration = overview.durationMs === null ? "" : " Page load capture took " + (Number(overview.durationMs) / 1000).toFixed(1) + " seconds.";
@@ -107,7 +147,9 @@ function renderAnalysisOutput(output, overview = null) {
     const sampleNote = graph?.sampled || semantic?.sampled
       ? " The evidence lists show up to the first " + sampleLimit + " records; REA's coverage fields report known analysis limits."
       : "";
-    capture.textContent = "This covers JavaScript retained from the initial public page. It does not cover signed-in pages, later interactions, or server-side code." + sampleNote + duration + access;
+    const pageScope = "This beta captured " + count(overview.pagesCaptured) + " public page(s) from a limit of " + count(overview.pageLimit) + ". Automatic discovery uses same-origin links from the supplied page.";
+    const coverageNote = overview.discoveryNote ? " " + overview.discoveryNote : "";
+    capture.textContent = pageScope + coverageNote + " It does not cover signed-in pages, submitted forms, or server-side code." + sampleNote + duration + access;
     section.append(capture);
     resultOutput.append(section);
 
@@ -127,6 +169,27 @@ function renderAnalysisOutput(output, overview = null) {
   evidence.className = "evidence-pre";
   evidence.textContent = output;
   resultOutput.append(evidence);
+}
+
+function renderWebsitePreviews(pages) {
+  websitePreview.replaceChildren();
+  const snapshots = (Array.isArray(pages) ? pages : []).filter(page => typeof page.screenshotDataUrl === "string");
+  for (const page of snapshots) {
+    const card = document.createElement("figure");
+    card.className = "website-preview-card";
+    const image = document.createElement("img");
+    image.src = page.screenshotDataUrl;
+    image.alt = "Screenshot of " + (page.title || page.url);
+    const caption = document.createElement("figcaption");
+    const title = document.createElement("strong");
+    title.textContent = page.title || "Public page";
+    const address = document.createElement("span");
+    address.textContent = page.url;
+    caption.append(title, address);
+    card.append(image, caption);
+    websitePreview.append(card);
+  }
+  websitePreview.hidden = snapshots.length === 0;
 }
 
 function switchTargetMode(mode) {
@@ -490,14 +553,14 @@ async function submitAnalysis(event, targetKind) {
   analyzeButton.disabled = true;
   if (!isWebsite) chooseButton.disabled = true;
   activeButton.querySelector(".button-label").textContent = isWebsite ? "Capturing website…" : "Analyzing locally…";
-  resultTitle.textContent = isWebsite ? "Capturing public page" : "Inspecting application";
+  resultTitle.textContent = isWebsite ? "Capturing linked pages" : "Inspecting application";
   setResultState("RUNNING", "running");
   emptyState.hidden = true;
   websitePreview.hidden = true;
-  websitePreviewImage.removeAttribute("src");
   resultOutput.hidden = false;
+  websitePreview.replaceChildren();
   renderAnalysisOutput(isWebsite
-    ? "REA is opening the first page in a temporary browser, recording its structure and loaded scripts, then analyzing captured JavaScript.\n"
+    ? "REA is discovering linked pages, capturing their structure and loaded scripts in a temporary browser, then analyzing the captured JavaScript.\n"
     : "REA is inventorying and parsing the selected application. Larger apps may take a little while.\n");
   latestAnalysisOutput = "";
   latestDisplayOutput = "";
@@ -506,20 +569,19 @@ async function submitAnalysis(event, targetKind) {
   aiOutput.hidden = true;
   aiOutput.textContent = "";
   setAiStatus(authState?.connected ? "Your latest REA results will appear here after analysis." : "Sign in with ChatGPT to ask questions about REA results.");
-  setStatus(isWebsite ? "Capturing the public page on this Mac. Keep this tab open until the result appears." : "Running REA locally. Keep this page open until the result appears.");
+  setStatus(isWebsite ? "Discovering and capturing public pages on this Mac. Keep this tab open until the result appears." : "Running REA locally. Keep this page open until the result appears.");
   copyButton.disabled = true;
 
   try {
     const response = await fetch(isWebsite ? "/api/analyze-website" : "/api/analyze", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(isWebsite ? { url: value } : { path: value }),
+      body: JSON.stringify(isWebsite ? { url: value, pageLimit: Number(websitePageLimitInput.value) } : { path: value }),
     });
     const data = await readResponse(response);
     if (data.stdout !== undefined || data.stderr !== undefined) {
-      const hasWebsiteScreenshot = isWebsite && typeof data.screenshotDataUrl === "string";
-      if (hasWebsiteScreenshot) websitePreviewImage.src = data.screenshotDataUrl;
-      websitePreview.hidden = !hasWebsiteScreenshot;
+      if (isWebsite) renderWebsitePreviews(data.overview?.pages);
+      else websitePreview.hidden = true;
       const sections = [];
       if (data.target?.url) sections.push("Website: " + data.target.url);
       if (data.target?.selectedPath) {
@@ -541,11 +603,12 @@ async function submitAnalysis(event, targetKind) {
       resultTitle.textContent = success ? (isWebsite ? "Website analysis complete" : "Analysis complete") : "Analysis needs attention";
       setResultState(success ? "COMPLETE" : "CHECK OUTPUT", success ? "complete" : "failed");
       setStatus(success
-        ? (isWebsite ? "REA captured the first page and analyzed its retained JavaScript. Review the evidence in the output panel." : "REA finished. Review the evidence in the output panel.")
+        ? (isWebsite ? "REA captured " + (data.overview?.pagesCaptured || 0) + " linked public page(s) and analyzed their retained JavaScript. Review the page inventory and evidence." : "REA finished. Review the evidence in the output panel.")
         : (data.error || "REA returned an error. See the output panel for details."), success ? "success" : "error");
       copyButton.disabled = false;
     } else {
       websitePreview.hidden = true;
+      websitePreview.replaceChildren();
       latestDisplayOutput = data.error || JSON.stringify(data, null, 2);
       renderAnalysisOutput(latestDisplayOutput);
       latestAnalysisOutput = "";
@@ -557,6 +620,7 @@ async function submitAnalysis(event, targetKind) {
     }
   } catch (error) {
     websitePreview.hidden = true;
+    websitePreview.replaceChildren();
     latestDisplayOutput = error.message;
     renderAnalysisOutput(latestDisplayOutput);
     latestAnalysisOutput = "";
