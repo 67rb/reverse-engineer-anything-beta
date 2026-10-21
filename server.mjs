@@ -1,4 +1,5 @@
 import { createServer, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { accessSync, constants, existsSync, readFile, statSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile as readFileAsync, rename, rm, writeFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
@@ -18,6 +19,8 @@ const MAX_EXPLANATION_BODY_BYTES = 256 * 1024;
 const MAX_EXPLANATION_CHARS = 80_000;
 const MAX_OUTPUT_BYTES = 20 * 1024 * 1024;
 const MAX_WEBSITE_CAPTURE_BYTES = 48 * 1024 * 1024;
+const MAX_SITE_DISCOVERY_HTML_BYTES = 2 * 1024 * 1024;
+const MAX_WEBSITE_PAGES = 5;
 const ANALYSIS_SAMPLE_LIMIT = 50;
 const ANALYSIS_OUTPUT_FILTER = [
   "normalized_result.input_path",
@@ -350,6 +353,189 @@ async function normalizeWebsiteUrl(input) {
   return parsed;
 }
 
+function requestPinnedWebsitePage(url) {
+  return resolvePublicIpv4(url.hostname).then((address) => new Promise((resolve, reject) => {
+    const encrypted = url.protocol === "https:";
+    const requester = encrypted ? httpsRequest : httpRequest;
+    const requestOptions = {
+      host: address,
+      family: 4,
+      port: Number(url.port || (encrypted ? 443 : 80)),
+      path: url.pathname + url.search,
+      method: "GET",
+      headers: {
+        host: url.host,
+        accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        connection: "close",
+        "user-agent": "REA-Local-Website-Analyzer",
+      },
+      timeout: 12000,
+    };
+    if (encrypted && net.isIP(url.hostname) === 0) requestOptions.servername = url.hostname;
+
+    const request = requester(requestOptions, (response) => {
+      const chunks = [];
+      let bytes = 0;
+      const declaredLength = Number(response.headers["content-length"]);
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_SITE_DISCOVERY_HTML_BYTES) {
+        response.destroy(new Error("The landing page is too large for automatic link discovery."));
+        return;
+      }
+      response.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > MAX_SITE_DISCOVERY_HTML_BYTES) {
+          response.destroy(new Error("The landing page is too large for automatic link discovery."));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => resolve({
+        statusCode: response.statusCode || 0,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+      response.on("error", reject);
+    });
+    request.on("timeout", () => request.destroy(new Error("The landing page request timed out.")));
+    request.on("error", reject);
+    request.end();
+  }));
+}
+
+async function fetchPublicWebsiteHtml(inputUrl, redirectCount = 0, visited = new Set()) {
+  const url = new URL(inputUrl);
+  url.hash = "";
+  if (visited.has(url.href)) throw new Error("The website redirected in a loop.");
+  visited.add(url.href);
+
+  const response = await requestPinnedWebsitePage(url);
+  const location = response.headers.location;
+  if (response.statusCode >= 300 && response.statusCode < 400 && location) {
+    if (redirectCount >= 4) throw new Error("The website used too many redirects for link discovery.");
+    const destination = new URL(location, url);
+    if ((destination.protocol !== "https:" && destination.protocol !== "http:") || destination.username || destination.password) {
+      throw new Error("The website redirected to an unsupported URL.");
+    }
+    return fetchPublicWebsiteHtml(destination, redirectCount + 1, visited);
+  }
+
+  const contentType = String(response.headers["content-type"] || "").toLowerCase();
+  if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+    return { html: "", finalUrl: url.href, reason: "The landing URL did not return an HTML page." };
+  }
+  if (response.statusCode < 200 || response.statusCode >= 400) {
+    return { html: "", finalUrl: url.href, reason: "The landing page did not return a successful response." };
+  }
+  return { html: response.body, finalUrl: url.href, reason: null };
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (_, number) => {
+      const codePoint = Number(number);
+      return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+        ? String.fromCodePoint(codePoint)
+        : "";
+    })
+    .replace(/&#x([\da-f]+);/gi, (_, number) => {
+      const codePoint = Number.parseInt(number, 16);
+      return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+        ? String.fromCodePoint(codePoint)
+        : "";
+    });
+}
+
+function plainHtmlText(value) {
+  return decodeHtmlEntities(String(value || "")
+    .replace(/<(script|style|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<[^>]*>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function htmlAttribute(tagAttributes, attributeName) {
+  const pattern = new RegExp("(?:^|\\s)" + attributeName + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i");
+  const match = String(tagAttributes || "").match(pattern);
+  return decodeHtmlEntities(match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim();
+}
+
+function discoverSameOriginLinks(html, baseUrl) {
+  const base = new URL(baseUrl);
+  const navigationHrefs = new Set();
+  for (const container of String(html || "").matchAll(/<(?:nav|header)\b[^>]*>([\s\S]*?)<\/(?:nav|header)\s*>/gi)) {
+    for (const anchor of container[1].matchAll(/<a\b([^>]*)>/gi)) {
+      const href = htmlAttribute(anchor[1], "href");
+      if (href) navigationHrefs.add(href);
+    }
+  }
+
+  const candidates = new Map();
+  let index = 0;
+  for (const anchor of String(html || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {
+    index += 1;
+    if (index > 1000) break;
+    const rawHref = htmlAttribute(anchor[1], "href");
+    if (!rawHref || /^(?:javascript:|mailto:|tel:|data:)/i.test(rawHref)) continue;
+    let target;
+    try { target = new URL(rawHref, base); }
+    catch { continue; }
+    if ((target.protocol !== "http:" && target.protocol !== "https:") || target.origin !== base.origin || target.username || target.password) continue;
+    target.hash = "";
+    if (target.search) continue;
+    const path = target.pathname.replace(/\/{2,}/g, "/");
+    if (/\.(?:avif|bmp|css|csv|docx?|eot|gif|ico|jpe?g|js|json|mp[34]|pdf|png|svg|ttf|txt|webm|woff2?|xlsx?|xml|zip)$/i.test(path)) continue;
+    if (/\/(?:account|admin|api|auth|cart|checkout|login|logout|register|search|sign-in|sign-out|sign-up)(?:\/|$)/i.test(path)) continue;
+    const basePath = base.pathname.replace(/\/$/, "") || "/";
+    const targetPath = target.pathname.replace(/\/$/, "") || "/";
+    if (targetPath === basePath || targetPath === "/" && basePath === "/") continue;
+
+    const label = plainHtmlText(anchor[2]).toLowerCase();
+    if (/\b(?:log\s?in|sign\s?in|sign\s?up|log\s?out|checkout|buy now|add to cart)\b/.test(label)) continue;
+    const key = target.origin + targetPath;
+    let score = 10;
+    if (navigationHrefs.has(rawHref)) score += 45;
+    if (/\b(?:about|company|contact|customers|docs|features|help|how it works|pricing|product|services|solutions|team)\b/.test(label + " " + targetPath)) score += 20;
+    if (targetPath.split("/").filter(Boolean).length > 4) score -= 8;
+    const existing = candidates.get(key);
+    const candidate = { url: target.href, score, index };
+    if (!existing || candidate.score > existing.score) candidates.set(key, candidate);
+  }
+  return [...candidates.values()]
+    .sort((left, right) => right.score - left.score || left.index - right.index);
+}
+
+async function discoverWebsitePages(url, pageLimit) {
+  if (pageLimit <= 1) {
+    return { pages: [url.href], pageLimit, discoveredPages: 1, note: "Automatic link discovery is off; only the supplied page will be captured." };
+  }
+  try {
+    const landingPage = await fetchPublicWebsiteHtml(url);
+    if (!landingPage.html) {
+      return { pages: [url.href], pageLimit, discoveredPages: 1, note: landingPage.reason || "Automatic link discovery was unavailable; only the supplied page will be captured." };
+    }
+    const discovered = discoverSameOriginLinks(landingPage.html, landingPage.finalUrl);
+    const selected = discovered.slice(0, Math.max(0, pageLimit - 1));
+    return {
+      pages: [url.href, ...selected.map((item) => item.url)],
+      pageLimit,
+      discoveredPages: discovered.length + 1,
+      note: selected.length ? "Additional pages were selected from public, same-origin links on the landing page." : "No additional same-origin page links were found on the landing page.",
+    };
+  } catch (error) {
+    return {
+      pages: [url.href],
+      pageLimit,
+      discoveredPages: 1,
+      note: "Automatic link discovery was unavailable (" + (error?.message || "request failed") + "); the supplied page will still be analyzed.",
+    };
+  }
+}
+
 function parseProxyAuthority(authority, defaultPort) {
   let parsed;
   try { parsed = new URL("http://" + authority); }
@@ -573,7 +759,65 @@ function unwrapCliResult(document, operation) {
   return document;
 }
 
-function browserScenarioSummary(capture, requestedUrl, exportedManifest) {
+function capturedStepUrl(step, fallbackUrl) {
+  const value = step?.artifacts?.url?.value;
+  const url = typeof value === "string" ? value : value?.url;
+  return url || step?.after_url || step?.before_url || fallbackUrl;
+}
+
+function extractWebsitePageSnapshots(capture, fallbackUrl) {
+  const steps = Array.isArray(capture?.steps) ? capture.steps : [];
+  const byLocation = new Map();
+  for (const step of steps) {
+    const dom = step?.artifacts?.dom;
+    if (dom?.state !== "captured" || typeof dom.value?.text !== "string") continue;
+    const url = capturedStepUrl(step, fallbackUrl);
+    let key = url;
+    try {
+      const parsed = new URL(url);
+      parsed.hash = "";
+      key = parsed.href;
+    } catch { /* Keep the tool-provided URL as the display key. */ }
+
+    const html = dom.value.text;
+    const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i);
+    let description = "";
+    for (const tag of html.matchAll(/<meta\b([^>]*)>/gi)) {
+      const name = htmlAttribute(tag[1], "name").toLowerCase();
+      const property = htmlAttribute(tag[1], "property").toLowerCase();
+      if (name === "description" || property === "og:description") {
+        description = htmlAttribute(tag[1], "content");
+        if (description) break;
+      }
+    }
+    const headings = [...html.matchAll(/<h([1-3])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi)]
+      .map((match) => ({ level: Number(match[1]), text: plainHtmlText(match[2]) }))
+      .filter((heading) => heading.text)
+      .slice(0, 12);
+    const screenshot = step?.artifacts?.screenshot;
+    const accessibility = step?.artifacts?.accessibility;
+    byLocation.set(key, {
+      url,
+      title: plainHtmlText(titleMatch?.[1] || "") || (() => {
+        try { return new URL(url, fallbackUrl).pathname || "Public page"; }
+        catch { return "Public page"; }
+      })(),
+      description: plainHtmlText(description).slice(0, 320),
+      headings,
+      linkCount: (html.match(/<a\b/gi) || []).length,
+      formControlCount: (html.match(/<(?:input|select|textarea)\b/gi) || []).length,
+      accessibilityText: accessibility?.state === "captured" && typeof accessibility.value?.text === "string"
+        ? accessibility.value.text.slice(0, 8000)
+        : "",
+      screenshotDataUrl: screenshot?.state === "captured" && typeof screenshot.value?.data_base64 === "string"
+        ? "data:image/png;base64," + screenshot.value.data_base64
+        : null,
+    });
+  }
+  return [...byLocation.values()].slice(0, MAX_WEBSITE_PAGES);
+}
+
+function browserScenarioSummary(capture, requestedUrl, exportedManifest, pageDiscovery) {
   const eventList = Array.isArray(capture?.events) ? capture.events : capture?.events?.items || [];
   const requests = eventList.filter((event) => event.kind === "request");
   const scriptRequests = requests.filter((event) => event.resource_type === "script");
@@ -586,35 +830,39 @@ function browserScenarioSummary(capture, requestedUrl, exportedManifest) {
   const dom = lastStep?.artifacts?.dom;
   const screenshot = lastStep?.artifacts?.screenshot;
   const accessibility = lastStep?.artifacts?.accessibility;
+  const pages = extractWebsitePageSnapshots(capture, requestedUrl);
   const sections = [
     "Website: " + requestedUrl,
     "Loaded page: " + finalUrl,
     "Browser capture: " + (capture?.duration_ms ?? "unknown") + " ms; " + requests.length + " network requests, " + scriptRequests.length + " script requests, " + capturedResponses + " response bodies retained.",
+    "Page coverage: " + pages.length + " of up to " + pageDiscovery.pageLimit + " pages captured; " + pageDiscovery.discoveredPages + " same-origin pages discovered.",
     "Page artifacts: DOM " + (dom?.state || "not captured") + "; screenshot " + (screenshot?.state || "not captured") + ".",
     "JavaScript files exported: " + exported + " of " + scripts.length + " script responses observed.",
-    "Scope: initial public page only. Sign-in and page interactions are not replayed. Script response retention is bounded to 256 KB per resource and 16 MB total.",
+    "Scope: public pages linked from the landing page. Sign-in and page interactions are not replayed. Script response retention is bounded to 256 KB per resource and 16 MB total.",
+    "Link discovery: " + pageDiscovery.note,
   ];
-  if (dom?.state === "captured" && typeof dom.value?.text === "string") {
+  if (pages.length) {
+    sections.push("\n--- Page inventory ---\n" + pages.map((page, index) => {
+      const headings = page.headings.map((heading) => "H" + heading.level + " " + heading.text).join(" · ") || "No H1–H3 headings captured";
+      const accessible = page.accessibilityText ? "\n   Visible content:\n   " + page.accessibilityText.slice(0, 3200).replace(/\n/g, "\n   ") : "";
+      return (index + 1) + ". " + page.title + "\n   " + page.url + "\n   " + headings + "\n   " + page.linkCount + " links; " + page.formControlCount + " form controls" + (page.description ? "\n   Description: " + page.description : "") + accessible;
+    }).join("\n"));
+  }
+  if (dom?.state === "captured" && typeof dom.value?.text === "string" && pages.length <= 1) {
     sections.push("\n--- Captured DOM snapshot (first 12,000 characters) ---\n" + dom.value.text.slice(0, 12000));
   }
-  if (accessibility?.state === "captured" && typeof accessibility.value?.text === "string") {
+  if (accessibility?.state === "captured" && typeof accessibility.value?.text === "string" && pages.length <= 1) {
     sections.push("\n--- Accessibility snapshot (first 8,000 characters) ---\n" + accessibility.value.text.slice(0, 8000));
   }
   return sections.join("\n");
 }
 
-function browserScreenshotDataUrl(capture) {
-  const steps = Array.isArray(capture?.steps) ? capture.steps : [];
-  const screenshot = steps.at(-1)?.artifacts?.screenshot;
-  if (screenshot?.state !== "captured" || typeof screenshot.value?.data_base64 !== "string") return null;
-  return "data:image/png;base64," + screenshot.value.data_base64;
-}
-
-function websiteAnalysisOverview(capture, requestedUrl, exportedManifest, analysisDocument) {
+function websiteAnalysisOverview(capture, requestedUrl, exportedManifest, analysisDocument, pageDiscovery) {
   const eventList = Array.isArray(capture?.events) ? capture.events : capture?.events?.items || [];
   const requests = eventList.filter((event) => event.kind === "request");
   const scripts = Array.isArray(exportedManifest?.scripts) ? exportedManifest.scripts : [];
   const lastStep = Array.isArray(capture?.steps) ? capture.steps.at(-1) : null;
+  const pages = extractWebsitePageSnapshots(capture, requestedUrl);
   const analysis = analysisDocument ? unwrapCliResult(analysisDocument, "JavaScript analysis") : null;
   const graph = analysis?.graph || {};
   const semanticGraph = analysis?.semantic_graph || {};
@@ -635,6 +883,11 @@ function websiteAnalysisOverview(capture, requestedUrl, exportedManifest, analys
     sampleLimit: ANALYSIS_SAMPLE_LIMIT,
     requestedUrl,
     loadedUrl: lastStep?.artifacts?.url?.value?.url || lastStep?.after_url || requestedUrl,
+    pageLimit: pageDiscovery.pageLimit,
+    discoveredPages: pageDiscovery.discoveredPages,
+    pagesCaptured: pages.length,
+    discoveryNote: pageDiscovery.note,
+    pages,
     durationMs: capture?.duration_ms ?? null,
     networkRequests: requests.length,
     scriptRequests: requests.filter((event) => event.resource_type === "script").length,
@@ -661,10 +914,11 @@ function websiteAnalysisOverview(capture, requestedUrl, exportedManifest, analys
   };
 }
 
-async function analyzeWebsite(binary, urlText) {
+async function analyzeWebsite(binary, urlText, pageLimit = MAX_WEBSITE_PAGES) {
   const url = await normalizeWebsiteUrl(urlText);
   const browserPath = findChromiumBrowser();
   if (!browserPath) throw Object.assign(new Error("Install Google Chrome, Chromium, Brave, or Microsoft Edge to capture a website."), { status: 503 });
+  const pageDiscovery = await discoverWebsitePages(url, pageLimit);
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "rea-website-analysis-"));
   let proxy;
   try {
@@ -693,6 +947,17 @@ async function analyzeWebsite(binary, urlText) {
       value: { source: "literal", value },
     }));
     scenarioUrl.search = "";
+    const actions = [{ step_id: "landing_page_settle", action: "wait_for_timeout", duration_ms: 1200 }];
+    for (const [index, pageUrl] of pageDiscovery.pages.slice(1).entries()) {
+      const pageNumber = index + 2;
+      actions.push({
+        step_id: "page_" + pageNumber + "_navigate",
+        action: "goto",
+        destination: { url: pageUrl, query: [] },
+        wait_until: "load",
+        timeout_ms: 15000,
+      });
+    }
     const scenario = {
       browser: { mode: "launch", executable_path: wrapperPath, headless: true },
       start_url: { url: scenarioUrl.toString(), query },
@@ -704,11 +969,11 @@ async function analyzeWebsite(binary, urlText) {
         reduced_motion: "reduce",
         service_workers: "block",
       },
-      actions: [{ step_id: "page_settle", action: "wait_for_timeout", duration_ms: 1200 }],
+      actions,
       storage: { cookies: [], local_storage: [], session_storage: [] },
       secrets: [],
       capture: {
-        after_each_step: [],
+        after_each_step: ["url", "screenshot", "dom", "accessibility"],
         at_end: ["url", "screenshot", "dom", "accessibility"],
         events: ["network", "console", "page-errors", "frames", "workers"],
         network: { request_body: false, response_body: true, header_values: false },
@@ -751,17 +1016,15 @@ async function analyzeWebsite(binary, urlText) {
       throw new Error("REA returned an unexpected script export manifest shape (" + fields + ").");
     }
 
-    const sections = [browserScenarioSummary(capture, url.toString(), manifest), "", "--- REA JavaScript analysis ---"];
-    const screenshotDataUrl = browserScreenshotDataUrl(capture);
+    const sections = [browserScenarioSummary(capture, url.toString(), manifest, pageDiscovery), "", "--- REA JavaScript analysis ---"];
     const scriptsInput = manifest.analysis_input?.input_path;
     if (!scriptsInput || !existsSync(scriptsInput) || !statSync(scriptsInput).isDirectory()) {
-      sections.push("No JavaScript response bodies were available to analyze. The browser capture and export manifest completed, but this page did not expose exportable script bytes within the selected retention limits.");
+      sections.push("No JavaScript response bodies were available to analyze. The browser capture and export manifest completed, but these pages did not expose exportable script bytes within the selected retention limits.");
       return {
         exitCode: 0,
         stdout: sections.join("\n"),
         stderr: captureResult.stderr + exportResult.stderr,
-        screenshotDataUrl,
-        overview: websiteAnalysisOverview(capture, url.toString(), manifest, null),
+        overview: websiteAnalysisOverview(capture, url.toString(), manifest, null, pageDiscovery),
         target: { url: url.toString(), kind: "public website" },
       };
     }
@@ -782,8 +1045,7 @@ async function analyzeWebsite(binary, urlText) {
       exitCode: analysisResult.exitCode,
       stdout: sections.join("\n"),
       stderr: captureResult.stderr + exportResult.stderr + analysisResult.stderr,
-      screenshotDataUrl,
-      overview: websiteAnalysisOverview(capture, url.toString(), manifest, analysisDocument),
+      overview: websiteAnalysisOverview(capture, url.toString(), manifest, analysisDocument, pageDiscovery),
       target: { url: url.toString(), kind: "public website" },
     };
   } finally {
@@ -1408,6 +1670,11 @@ async function handleRequest(request, response, server) {
       sendJson(response, 409, { error: "An analysis is already running. Wait for it to finish before starting another." });
       return;
     }
+    const pageLimit = body.pageLimit === undefined ? MAX_WEBSITE_PAGES : Number(body.pageLimit);
+    if (!Number.isInteger(pageLimit) || pageLimit < 1 || pageLimit > MAX_WEBSITE_PAGES) {
+      sendJson(response, 400, { error: "Choose a page coverage limit from 1 to " + MAX_WEBSITE_PAGES + "." });
+      return;
+    }
     const binary = locateExecutable("rea");
     if (!binary) {
       sendJson(response, 503, { error: "The rea command is not on this server's PATH. Start the site from Terminal where rea is installed." });
@@ -1416,7 +1683,7 @@ async function handleRequest(request, response, server) {
 
     activeAnalysis = true;
     try {
-      const result = await analyzeWebsite(binary, body.url);
+      const result = await analyzeWebsite(binary, body.url, pageLimit);
       sendJson(response, result.exitCode === 0 ? 200 : 422, result);
     } catch (error) {
       sendJson(response, error.status || 422, { error: error.message || "Website analysis failed." });
